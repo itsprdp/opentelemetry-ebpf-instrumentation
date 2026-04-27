@@ -5,9 +5,11 @@ package service
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -173,4 +175,106 @@ func TestHandleMessagesQueue_DropsStalledClientOnSendTimeout(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("handleMessagesQueue did not return within 200ms — sendTimeout was not enforced")
 	}
+}
+
+// fakeStream is a fake ServerStreamingServer whose Send delegates to send.
+type fakeStream struct {
+	grpc.ServerStream
+	send func() error
+}
+
+func (f *fakeStream) Send(*informer.Event) error { return f.send() }
+
+// TestHandleMessagesQueue_DisabledTimeout_PassesSendThrough verifies that
+// sendTimeout == 0 keeps the original unbounded Send path: events flow
+// through and the loop exits cleanly on the nil sentinel.
+func TestHandleMessagesQueue_DisabledTimeout_PassesSendThrough(t *testing.T) {
+	var sent atomic.Int32
+	o := &connection{
+		log:      slog.New(slog.DiscardHandler),
+		id:       "test-client",
+		server:   &fakeStream{send: func() error { sent.Add(1); return nil }},
+		metrics:  instrument.FromContext(context.Background()),
+		messages: sync.NewQueue[*informer.Event](),
+	}
+	o.messages.Enqueue(&informer.Event{})
+	o.messages.Enqueue(nil)
+
+	done := make(chan struct{})
+	go func() {
+		o.handleMessagesQueue(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("handleMessagesQueue did not return")
+	}
+	require.Equal(t, int32(1), sent.Load())
+}
+
+// TestHandleMessagesQueue_DropsOnSendError verifies that a Send error on the
+// bounded path returns from handleMessagesQueue immediately (no need to wait
+// for sendTimeout to elapse).
+func TestHandleMessagesQueue_DropsOnSendError(t *testing.T) {
+	o := &connection{
+		log:         slog.New(slog.DiscardHandler),
+		id:          "test-client",
+		server:      &fakeStream{send: func() error { return errors.New("send failed") }},
+		sendTimeout: 50 * time.Millisecond,
+		metrics:     instrument.FromContext(context.Background()),
+		messages:    sync.NewQueue[*informer.Event](),
+	}
+	o.messages.Enqueue(&informer.Event{})
+
+	done := make(chan struct{})
+	go func() {
+		o.handleMessagesQueue(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("handleMessagesQueue did not return on Send error")
+	}
+}
+
+// TestHandleMessagesQueue_TimerResetDoesNotFalseFire verifies that the
+// Stop/drain/Reset cycle correctly rearms the timer between iterations: many
+// Sends comfortably under the timeout must all complete without a spurious
+// timer fire.
+func TestHandleMessagesQueue_TimerResetDoesNotFalseFire(t *testing.T) {
+	const events = 20
+	var sent atomic.Int32
+	o := &connection{
+		log: slog.New(slog.DiscardHandler),
+		id:  "test-client",
+		server: &fakeStream{send: func() error {
+			time.Sleep(10 * time.Millisecond)
+			sent.Add(1)
+			return nil
+		}},
+		sendTimeout: 50 * time.Millisecond,
+		metrics:     instrument.FromContext(context.Background()),
+		messages:    sync.NewQueue[*informer.Event](),
+	}
+	for range events {
+		o.messages.Enqueue(&informer.Event{})
+	}
+	o.messages.Enqueue(nil)
+
+	done := make(chan struct{})
+	go func() {
+		o.handleMessagesQueue(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleMessagesQueue did not return — likely a spurious timer fire")
+	}
+	require.Equal(t, int32(events), sent.Load(), "every Send must complete")
 }
